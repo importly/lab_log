@@ -5,3 +5,4 @@
 .vscode/settings.json
 /clients/python/lab_log/__pycache__
 /clients/python/tests/__pycache__
+server/lab_log.db

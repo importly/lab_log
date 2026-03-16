@@ -12,8 +12,8 @@ except ImportError:
     torch = None
 
 # specialized primitive handlers
-def _handle_bool(val: bool) -> Tuple[str, bool]:
-    return "bool", val
+def _handle_bool(val: bool) -> Tuple[str, int]:
+    return "bool", 1 if val else 0
 
 def _handle_int(val: Any) -> Tuple[str, int]:
     return "i64", int(val)

@@ -61,9 +61,10 @@ class LabLog:
         self._lock = threading.Lock()
         self._log_file_count = 0
         self._current_log_size = 0
+        self.trial_number = 0
         
         self.config = {
-            "sync_interval": 60,
+            "sync_interval": 30,
             "chunk_size_mb": 32,
             "non_loggable_params": {},
             "cache_dir": cache_dir
@@ -74,18 +75,28 @@ class LabLog:
         self.run_path.mkdir(parents=True, exist_ok=True)
         (self.run_path / "chunks").mkdir(exist_ok=True)
 
-        self._write_manifest() # save manifest
-        self._send_manifest()   # try to send to server
+        self._init_sync_state()
+        self._write_manifest()
+        self._send_manifest()
+
+    def _init_sync_state(self):
+        state_path = self.run_path / "sync_state.json"
+        state = {
+            "confirmed_chunks": [],
+            "pending_chunks": [],
+            "total_frames_written": 0
+        }
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
 
     def _send_manifest(self):
         url = f"http://{self.server}/runs"
         try:
             response = requests.post(url, json=self._generate_manifest(), timeout=2.0)
-            if response.status_code == 200:
+            if response.status_code in (200, 201):
                 data = response.json()
-                # If server returns a trial_number, we can update it locally if needed
-                #TODO Future: update local manifest with server response)
-                pass
+                self.trial_number = data.get("trial_number", 0)
+                self._write_manifest()
             else:
                 warnings.warn(f"Server rejected manifest with status {response.status_code}. Continuing locally.")
         except Exception as e:
@@ -234,6 +245,7 @@ class LabLog:
             "run_id": self.run_id,
             "experiment_id": self.experiment_id,
             "trial_name": self.trial_name,
+            "trial_number": self.trial_number,
             "researcher": self.researcher,
             "hostname": self.hostname,
             "timestamp_start_utc": self.timestamp_start.isoformat(timespec='seconds').replace("+00:00", "Z"),
