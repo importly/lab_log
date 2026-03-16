@@ -1,25 +1,34 @@
+from pathlib import Path
 from lab_log.logger import LabLog
+import json
 
-def test_general():
+def test_general(tmp_path):
+    cache_dir = tmp_path / "cache"
+    
+    experiment_id = "laser-testing"
+    trial_name = "new wavelength test"
+    
     logger = LabLog(
-        trial_name="new wavelength test",
-        experiment_id="laser-testing",
+        trial_name=trial_name,
+        experiment_id=experiment_id,
         researcher="aryan",
         hostname="lab-machine-01",
+        cache_dir=str(cache_dir)
     )
     
     assert logger is not None
     
-    runid = logger.run_id
-    assert runid is not None
-    print(f"Generated run ID: {runid}")
+    assert logger.run_path.exists()
+    assert logger.run_path.parent.name == experiment_id
+    assert logger.run_path.name == logger.run_id
     
-    manifest = logger._generate_manifest()
-    assert manifest["trial_name"] == "new wavelength test"
-    assert manifest["experiment_id"] == "laser-testing"
-    assert manifest["run_id"] == runid
-    assert "timestamp_start_utc" in manifest
-    print(f"Generated manifest: {manifest}")
+    manifest_file = logger.run_path / "manifest.json"
+    assert manifest_file.exists()
     
-    
-    
+    with open(manifest_file, "r") as f:
+        manifest = json.load(f)
+        assert manifest["trial_name"] == trial_name
+        assert manifest["experiment_id"] == experiment_id
+        assert manifest["run_id"] == logger.run_id
+        assert "timestamp_start_utc" in manifest
+        print(f"Verified manifest on disk: {manifest}")
