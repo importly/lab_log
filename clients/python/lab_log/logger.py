@@ -12,7 +12,13 @@ import base64
 from importlib.metadata import version, PackageNotFoundError
 
 from .channel import ChannelDef
+from .serialize import get_or_make_handler
 from .serialize import resolve_value
+
+# function localization for commonly used paths
+_pack_uint32 = struct.Struct("<I").pack
+_msgpack_packb = msgpack.packb
+_time_ns = time.time_ns
 
 class LabLog:
     trial_name: str # name of trial
@@ -117,20 +123,22 @@ class LabLog:
         self._write_manifest()
 
     def log(self, channel_name: str, value: Any, timestamp: Optional[int] = None):
+        # now using hashtable, much faster lookups.
         ch = self.channels.get(channel_name)
         if ch is None:
             warnings.warn(f"Ad-hoc logging to undeclared channel '{channel_name}'")
-            # auto_detection script, useful for dynamically declared variables. 
-            # suppress warnings if used frequently.
             resolved_dtype, _ = resolve_value(None, value)
             ch = ChannelDef(name=channel_name, dtype=resolved_dtype)
             self.channels[channel_name] = ch
             self._write_manifest()
+
+        # save used handler
+        if ch._cached_handler is None:
+            ch._cached_handler = get_or_make_handler(ch, value)
         
-        ts_ns = timestamp if timestamp is not None else time.time_ns()
+        ts_ns = timestamp if timestamp is not None else _time_ns()
         
-        # serialize value according to dtype and Tier rules
-        resolved_dtype, serialized_value = resolve_value(ch, value)
+        _, serialized_value = ch._cached_handler(value)
         
         payload = {
             "c": channel_name,
@@ -138,19 +146,20 @@ class LabLog:
             "v": serialized_value
         }
         
-        # packing with msgpack
-        encoded_payload = msgpack.packb(payload, use_bin_type=True)
+        encoded_payload = _msgpack_packb(payload, use_bin_type=True)
+        if encoded_payload is None:
+            raise ValueError("msgpack encoding failed")
         
         with self._lock:
             if self._log_file is None:
                 self._log_file = open(self.run_path / "log.bin", "ab")
-   
-            if encoded_payload is None:
-                raise ValueError("Encoded payload is None, cannot write to log.")
-            header = struct.pack("<I", len(encoded_payload))
+            
+            # little-endian length prefix
+            header = _pack_uint32(len(encoded_payload))
             self._log_file.write(header)
             self._log_file.write(encoded_payload)
             self._log_file.flush()
+
 
     def sync(self):
         #TODO Background sync

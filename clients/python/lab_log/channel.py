@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, List
 
-# Valid dtypes from lab_log_architecture.md
+# Valid dtypes, will define in final documentation
 VALID_DTYPES = {
     "f16", "f32", "f64",
     "i8", "i16", "i32", "i64",
@@ -22,6 +22,7 @@ class ChannelDef:
     frequency_hz: Optional[float] = None
     serializer: Optional[Callable[[Any], Any]] = None
     pickle: bool = False # pickle saves the Python object directly and has json for fallback
+    _cached_handler: Optional[Callable[[Any], Any]] = field(default=None, repr=False, compare=False) # cached serialization handler
 
     def validate(self):
         if self.dtype not in VALID_DTYPES:
