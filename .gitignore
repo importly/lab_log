@@ -2,3 +2,6 @@
 /notes
 /server/target
 /server/Cargo.lock
+.vscode/settings.json
+/clients/python/lab_log/__pycache__
+/clients/python/tests/__pycache__
