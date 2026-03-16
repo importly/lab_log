@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lab-log"
+version = "0.1.0"
+description = "logging system for university research labs"
+readme = "../../README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "msgpack",
+    "numpy",
+    "requests",
+    "h5py",
+    "torch"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lab_log"]
