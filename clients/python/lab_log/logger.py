@@ -1,5 +1,6 @@
 import struct
 from datetime import datetime, timezone
+from typing import Any
 import msgpack
 import uuid
 import base64
@@ -21,8 +22,7 @@ class LabLog:
     run_id:str
     
     timestamp_start:datetime # all times in utc
-    
-        
+            
     
     def __init__(self, trial_name:str, experiment_id:str, researcher:str = "", hostname:str = "", server:str = "localhost:36524"):
         self.trial_name = trial_name
@@ -51,12 +51,12 @@ class LabLog:
         return
     
 
-    def _generate_short_uuid(self):
+    def _generate_short_uuid(self) -> str:
         u = uuid.uuid4()
         short = base64.urlsafe_b64encode(u.bytes).decode('utf-8')
         return short.rstrip('=')
     
-    def _generate_manifest(self):
+    def _generate_manifest(self) -> dict[str, Any]:
         return {
             "trial_name": self.trial_name,
             "experiment_id": self.experiment_id,
