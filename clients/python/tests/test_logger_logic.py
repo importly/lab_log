@@ -86,7 +86,8 @@ def test_adhoc_logging(tmp_path):
         
     # Should still appear in manifest
     manifest = logger._generate_manifest()
-    assert "surprise" in manifest["declared_channels"]
+    channel_names = [ch["name"] for ch in manifest["declared_channels"]]
+    assert "surprise" in channel_names
 
 def test_context_manager(tmp_path):
     cache_dir = tmp_path / "cache"

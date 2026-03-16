@@ -3,12 +3,14 @@ import json
 import time
 import threading
 import warnings
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Optional, Callable, Dict, List
 from pathlib import Path
 import msgpack
 import uuid
 import base64
+import requests
 from importlib.metadata import version, PackageNotFoundError
 
 from .channel import ChannelDef
@@ -36,6 +38,8 @@ class LabLog:
     config: Dict[str, Any]
     _lock: threading.Lock
     _log_file: Optional[Any] = None
+    _log_file_count: int = 0
+    _current_log_size: int = 0
     
     timestamp_start: datetime # all times in utc
             
@@ -55,10 +59,12 @@ class LabLog:
         self.timestamp_start = datetime.now(timezone.utc)
         self.channels = {}
         self._lock = threading.Lock()
+        self._log_file_count = 0
+        self._current_log_size = 0
         
         self.config = {
             "sync_interval": 60,
-            "chunk_size_mb": 10,
+            "chunk_size_mb": 32,
             "non_loggable_params": {},
             "cache_dir": cache_dir
         }
@@ -66,8 +72,24 @@ class LabLog:
         # cache_dir/<experiment_id>/<run_id>/
         self.run_path = Path(self.config["cache_dir"]).expanduser() / self.experiment_id / self.run_id
         self.run_path.mkdir(parents=True, exist_ok=True)
+        (self.run_path / "chunks").mkdir(exist_ok=True)
 
         self._write_manifest() # save manifest
+        self._send_manifest()   # try to send to server
+
+    def _send_manifest(self):
+        url = f"http://{self.server}/runs"
+        try:
+            response = requests.post(url, json=self._generate_manifest(), timeout=2.0)
+            if response.status_code == 200:
+                data = response.json()
+                # If server returns a trial_number, we can update it locally if needed
+                #TODO Future: update local manifest with server response)
+                pass
+            else:
+                warnings.warn(f"Server rejected manifest with status {response.status_code}. Continuing locally.")
+        except Exception as e:
+            warnings.warn(f"Failed to reach server {self.server}: {e}. Continuing locally.")
 
     def __enter__(self):
         return self
@@ -78,7 +100,7 @@ class LabLog:
 
     def configure(self, 
                   sync_interval: Optional[int] = None, 
-                  chunk_size_mb: Optional[int] = None, 
+                  chunk_size_mb: Optional[float] = None, 
                   non_loggable_params: Optional[dict] = None, 
                   server: Optional[str] = None):
         
@@ -150,16 +172,35 @@ class LabLog:
         if encoded_payload is None:
             raise ValueError("msgpack encoding failed")
         
+        frame_len = 4 + len(encoded_payload)
+        
         with self._lock:
+            chunk_size_bytes = self.config["chunk_size_mb"] * 1024 * 1024
+            if self._log_file is not None and self._current_log_size + frame_len > chunk_size_bytes:
+                self._rotate_log_file()
+
             if self._log_file is None:
                 self._log_file = open(self.run_path / "log.bin", "ab")
+                self._current_log_size = 0
             
-            # little-endian length prefix
+            # 4-byte uint32 little-endian length prefix
             header = _pack_uint32(len(encoded_payload))
             self._log_file.write(header)
             self._log_file.write(encoded_payload)
             self._log_file.flush()
+            self._current_log_size += frame_len
 
+    def _rotate_log_file(self):
+        if self._log_file:
+            self._log_file.close()
+            self._log_file = None
+            
+        src = self.run_path / "log.bin"
+        if src.exists():
+            dest = self.run_path / "chunks" / f"{self._log_file_count:04d}.bin"
+            shutil.move(str(src), str(dest))
+            self._log_file_count += 1
+            self._current_log_size = 0
 
     def sync(self):
         #TODO Background sync
@@ -170,8 +211,11 @@ class LabLog:
             if self._log_file:
                 self._log_file.close()
                 self._log_file = None
-        
-        #TODO finalize completion for server
+
+            self._rotate_log_file()
+            
+            #TODO finalize completion for server
+            pass
         pass
 
     def _generate_short_uuid(self) -> str:
@@ -196,5 +240,5 @@ class LabLog:
             "lab_log_version": self._get_version(),
             "server": self.server,
             "non_loggable_params": self.config["non_loggable_params"],
-            "declared_channels": {name: ch.to_dict() for name, ch in self.channels.items()}
+            "declared_channels": [ch.to_dict() for ch in self.channels.values()]
         }
