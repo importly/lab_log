@@ -16,6 +16,7 @@ from importlib.metadata import version, PackageNotFoundError
 from .channel import ChannelDef
 from .serialize import get_or_make_handler
 from .serialize import resolve_value
+from .sync import ChunkSyncer, BackgroundSyncThread
 
 # function localization for commonly used paths
 _pack_uint32 = struct.Struct("<I").pack
@@ -77,7 +78,14 @@ class LabLog:
 
         self._init_sync_state()
         self._write_manifest()
-        self._send_manifest()
+        server_reachable = self._send_manifest()
+
+        self._syncer = ChunkSyncer(self.run_path, self.run_id, self.server,
+                                   server_reachable=server_reachable)
+        self._bg_sync: Optional[BackgroundSyncThread] = None
+        if self.config["sync_interval"] > 0:
+            self._bg_sync = BackgroundSyncThread(self._syncer, self.config["sync_interval"])
+            self._bg_sync.start()
 
     def _init_sync_state(self):
         state_path = self.run_path / "sync_state.json"
@@ -89,18 +97,21 @@ class LabLog:
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
 
-    def _send_manifest(self):
+    def _send_manifest(self) -> bool:
         url = f"http://{self.server}/runs"
         try:
-            response = requests.post(url, json=self._generate_manifest(), timeout=2.0)
+            response = requests.post(url, json=self._generate_manifest(), timeout=0.5)
             if response.status_code in (200, 201):
                 data = response.json()
                 self.trial_number = data.get("trial_number", 0)
                 self._write_manifest()
+                return True
             else:
                 warnings.warn(f"Server rejected manifest with status {response.status_code}. Continuing locally.")
+                return False
         except Exception as e:
             warnings.warn(f"Failed to reach server {self.server}: {e}. Continuing locally.")
+            return False
 
     def __enter__(self):
         return self
@@ -120,6 +131,15 @@ class LabLog:
         if non_loggable_params is not None: self.config["non_loggable_params"] = non_loggable_params
         if server is not None: self.server = server
         
+        # sync reset
+        if sync_interval is not None:
+            if self._bg_sync is not None:
+                self._bg_sync.stop()
+                self._bg_sync = None
+            if self.config["sync_interval"] > 0:
+                self._bg_sync = BackgroundSyncThread(self._syncer, self.config["sync_interval"])
+                self._bg_sync.start()
+
         self._write_manifest()
 
     def _write_manifest(self):
@@ -214,20 +234,27 @@ class LabLog:
             self._current_log_size = 0
 
     def sync(self):
-        #TODO Background sync
-        pass
+        with self._lock:
+            self._rotate_log_file()
+        self._syncer.sync_pending()
 
     def complete(self, status: str = "complete"):
         with self._lock:
             if self._log_file:
                 self._log_file.close()
                 self._log_file = None
-
             self._rotate_log_file()
-            
-            #TODO finalize completion for server
-            pass
-        pass
+
+        if self._bg_sync is not None:
+            self._bg_sync.stop()
+            self._bg_sync = None
+
+        self._syncer.sync_pending()
+
+        final_chunk_idx = self._log_file_count - 1  # _log_file_count is next idx, so -1 is last
+
+        if status == "complete":
+            self._syncer.complete(final_chunk_idx)
 
     def _generate_short_uuid(self) -> str:
         u = uuid.uuid4()
