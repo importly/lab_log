@@ -1,2 +1,3 @@
 from .logger import LabLog
-__all__ = ["LabLog"]
+from .reader import LabLogRun
+__all__ = ["LabLog", "LabLogRun"]

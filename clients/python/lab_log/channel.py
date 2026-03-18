@@ -10,6 +10,8 @@ VALID_DTYPES = {
     "bool", "str", "json", "bytes", "datetime"
 }
 
+VALID_COMPRESSIONS = {"gzip", "lz4", "none"}
+
 @dataclass
 class ChannelDef:
     name: str
@@ -28,6 +30,9 @@ class ChannelDef:
         if self.dtype not in VALID_DTYPES:
             raise ValueError(f"Invalid dtype '{self.dtype}'. Must be one of {VALID_DTYPES}")
         
+        if self.compression not in VALID_COMPRESSIONS:
+            raise ValueError(f"Invalid compression '{self.compression}'. Must be one of {VALID_COMPRESSIONS}")
+
         if self.pickle:
             if self.dtype != "json" or self.serializer is None:
                 raise ValueError("pickle=True requires dtype='json' and a custom serializer.")
@@ -44,6 +49,7 @@ class ChannelDef:
             "unit": self.unit,
             "compression": self.compression,
             "compression_level": self.compression_level,
+            "pickle": self.pickle,
         }
         if self.frequency_hz:
             d["frequency_hz"] = self.frequency_hz

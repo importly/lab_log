@@ -8,3 +8,4 @@
 /server/lab_log.db
 /server/portal/node_modules
 /server/storage
+/clients/python/.idea

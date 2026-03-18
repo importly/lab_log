@@ -47,6 +47,10 @@ def test_large_array_logging(tmp_path):
         chunks_dir = logger.run_path / "chunks"
         assert len(list(chunks_dir.glob("*.bin"))) >= 1
 
+class MockDevice:
+    def __init__(self, value):
+        self.value = value
+
 def test_pickle_fallback_logic(tmp_path):
     """
     Verify the Tier 3 (Pickle) structure in the serialized output.
@@ -55,10 +59,6 @@ def test_pickle_fallback_logic(tmp_path):
     
     def my_serializer(obj):
         return {"val": obj.value}
-
-    class MockDevice:
-        def __init__(self, value):
-            self.value = value
 
     with LabLog("pickle_test", "pickle_exp", cache_dir=str(cache_dir)) as logger:
         logger.declare_channel("dev", dtype="json", pickle=True, serializer=my_serializer)

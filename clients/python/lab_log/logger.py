@@ -1,3 +1,4 @@
+import os
 import struct
 import json
 import time
@@ -36,6 +37,87 @@ class LabLog:
     # 1. float, int, ndarray, Tensor
     # 2. string, dict, list, model weights
     # 3. JSON version of a device.
+    
+    _GLOBAL_CONFIG = {
+        "auto_recover_orphans": os.getenv("LABLOG_AUTO_RECOVER", "false").lower() == "true",
+        "cache_dir": os.getenv("LABLOG_CACHE_DIR", "~/.lablog/cache")
+    }
+
+    @staticmethod
+    def configure_global(auto_recover_orphans: Optional[bool] = None, cache_dir: Optional[str] = None):
+        if auto_recover_orphans is not None:
+            LabLog._GLOBAL_CONFIG["auto_recover_orphans"] = auto_recover_orphans
+        if cache_dir is not None:
+            LabLog._GLOBAL_CONFIG["cache_dir"] = cache_dir
+
+    @staticmethod
+    def find_orphaned_runs() -> List[Dict[str, Any]]:
+        cache_root = Path(LabLog._GLOBAL_CONFIG["cache_dir"]).expanduser()
+        if not cache_root.exists():
+            return []
+        
+        orphans = []
+        # ~/.lablog/cache/<experiment_id>/<run_id>/
+        for exp_dir in cache_root.iterdir():
+            if not exp_dir.is_dir():
+                continue
+            for run_dir in exp_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                
+                manifest_path = run_dir / "manifest.json"
+                active_path = run_dir / ".active"
+                if manifest_path.exists() and not active_path.exists():
+                    try:
+                        with open(manifest_path, "r") as f:
+                            manifest = json.load(f)
+                        # currently making any thing in the cache be an orphan if it not the active path.
+                        orphans.append({
+                            "run_id": manifest.get("run_id"),
+                            "experiment_id": manifest.get("experiment_id"),
+                            "trial_name": manifest.get("trial_name"),
+                            "last_modified": datetime.fromtimestamp(run_dir.stat().st_mtime, tz=timezone.utc),
+                            "status": "incomplete",
+                            "path": run_dir
+                        })
+                    except Exception:
+                        continue
+        return orphans
+
+    @staticmethod
+    def finalize_orphan(run_id: str, server: str = "localhost:36524", ssl_verify: bool | str = True):
+        orphans = LabLog.find_orphaned_runs()
+        orphan = next((o for o in orphans if o["run_id"] == run_id), None)
+        if not orphan:
+            warnings.warn(f"Orphaned run {run_id} not found")
+            return
+
+        run_path = orphan["path"]
+        syncer = ChunkSyncer(run_path, run_id, server, ssl_verify=ssl_verify)
+        syncer.sync_pending()
+        
+        # determine last chunk index
+        chunk_files = list((run_path / "chunks").glob("*.bin"))
+        if chunk_files:
+            final_idx = max(int(p.stem) for p in chunk_files)
+        else:
+            final_idx = -1
+            
+        res = syncer.complete(final_idx)
+        if res:
+            shutil.rmtree(run_path)
+            return True
+        return False
+
+    @staticmethod
+    def discard_orphan(run_id: str):
+        orphans = LabLog.find_orphaned_runs()
+        orphan = next((o for o in orphans if o["run_id"] == run_id), None)
+        if orphan:
+            shutil.rmtree(orphan["path"])
+            return True
+        return False
+
     config: Dict[str, Any]
     _lock: threading.Lock
     _log_file: Optional[Any] = None
@@ -50,12 +132,25 @@ class LabLog:
                  researcher: str = "", 
                  hostname: str = "", 
                  server: str = "localhost:36524",
-                 cache_dir: str = "~/.lablog/cache"):
+                 cache_dir: Optional[str] = None,
+                 ssl_verify: bool | str = False):
+        """LabLog object, contains everything to run client, declare channels, and sync data with server
+
+        Args:
+            trial_name (str): Descriptive name of this trial/run, e.g. "lr=0.01, batch=32"
+            experiment_id (str): Name for group of related trials.
+            researcher (str, optional): Researcher name. Defaults to "".
+            hostname (str, optional): Computer. Defaults to "".
+            server (_type_, optional): IP:port address. Defaults to "localhost:36524".
+            cache_dir (Optional[str], optional): Where to save files. Defaults to ~/.lablog/cache.
+            ssl_verify (bool | str, optional): Either provide a path to a server cert "certs/server_cert.pem" or leave as false. Defaults to False.
+        """        
         self.trial_name = trial_name
         self.experiment_id = experiment_id
         self.researcher = researcher
         self.hostname = hostname
         self.server = server
+        self.ssl_verify = ssl_verify
         self.run_id = self._generate_short_uuid()
         self.timestamp_start = datetime.now(timezone.utc)
         self.channels = {}
@@ -64,11 +159,12 @@ class LabLog:
         self._current_log_size = 0
         self.trial_number = 0
         
+        effective_cache_dir = cache_dir or LabLog._GLOBAL_CONFIG["cache_dir"]
         self.config = {
             "sync_interval": 30,
             "chunk_size_mb": 32,
             "non_loggable_params": {},
-            "cache_dir": cache_dir
+            "cache_dir": effective_cache_dir
         }
 
         # cache_dir/<experiment_id>/<run_id>/
@@ -76,16 +172,33 @@ class LabLog:
         self.run_path.mkdir(parents=True, exist_ok=True)
         (self.run_path / "chunks").mkdir(exist_ok=True)
 
+        # locking system
+        self._lock_file_path = self.run_path / ".active"
+        self._lock_file_path.touch()
+
+        if LabLog._GLOBAL_CONFIG["auto_recover_orphans"]:
+            self._recover_orphans()
+
         self._init_sync_state()
         self._write_manifest()
-        server_reachable = self._send_manifest()
+        self._send_manifest()
 
         self._syncer = ChunkSyncer(self.run_path, self.run_id, self.server,
-                                   server_reachable=server_reachable)
+                                   ssl_verify=self.ssl_verify)
         self._bg_sync: Optional[BackgroundSyncThread] = None
         if self.config["sync_interval"] > 0:
-            self._bg_sync = BackgroundSyncThread(self._syncer, self.config["sync_interval"])
+            self._bg_sync = BackgroundSyncThread(self._sync_internal, self.config["sync_interval"])
             self._bg_sync.start()
+
+    def _recover_orphans(self):
+        orphans = LabLog.find_orphaned_runs()
+        for orphan in orphans:
+            if orphan["run_id"] == self.run_id:
+                continue
+            try:
+                LabLog.finalize_orphan(orphan["run_id"], self.server, ssl_verify=self.ssl_verify)
+            except Exception as e:
+                warnings.warn(f"Failed to auto-recover orphan {orphan['run_id']}: {e}")
 
     def _init_sync_state(self):
         state_path = self.run_path / "sync_state.json"
@@ -98,13 +211,13 @@ class LabLog:
             json.dump(state, f, indent=2)
 
     def _send_manifest(self) -> bool:
-        url = f"http://{self.server}/runs"
+        url = f"https://{self.server}/runs"
         try:
-            response = requests.post(url, json=self._generate_manifest(), timeout=0.5)
+            response = requests.post(url, json=self._generate_manifest(), timeout=0.5, verify=self.ssl_verify)
             if response.status_code in (200, 201):
                 data = response.json()
                 self.trial_number = data.get("trial_number", 0)
-                self._write_manifest()
+                self._write_manifest(sync_to_server=False)
                 return True
             else:
                 warnings.warn(f"Server rejected manifest with status {response.status_code}. Continuing locally.")
@@ -137,15 +250,23 @@ class LabLog:
                 self._bg_sync.stop()
                 self._bg_sync = None
             if self.config["sync_interval"] > 0:
-                self._bg_sync = BackgroundSyncThread(self._syncer, self.config["sync_interval"])
+                self._bg_sync = BackgroundSyncThread(self._sync_internal, self.config["sync_interval"])
                 self._bg_sync.start()
 
-        self._write_manifest()
+        self._write_manifest(sync_to_server=True)
 
-    def _write_manifest(self):
+    def _write_manifest(self, sync_to_server: bool = True):
         manifest_path = self.run_path / "manifest.json"
+        manifest_data = self._generate_manifest()
         with open(manifest_path, "w") as f:
-            json.dump(self._generate_manifest(), f, indent=2)
+            json.dump(manifest_data, f, indent=2)
+            
+        if sync_to_server and getattr(self, "server", None):
+            try:
+                # Use a short timeout so logging doesn't block heavily
+                requests.post(f"https://{self.server}/runs", json=manifest_data, timeout=0.2, verify=self.ssl_verify)
+            except Exception:
+                pass
 
     def declare_channel(self, 
                         name: str, 
@@ -173,7 +294,7 @@ class LabLog:
         )
         ch.validate()
         self.channels[name] = ch
-        self._write_manifest()
+        self._write_manifest(sync_to_server=True)
 
     def log(self, channel_name: str, value: Any, timestamp: Optional[int] = None):
         # now using hashtable, much faster lookups.
@@ -183,7 +304,7 @@ class LabLog:
             resolved_dtype, _ = resolve_value(None, value)
             ch = ChannelDef(name=channel_name, dtype=resolved_dtype)
             self.channels[channel_name] = ch
-            self._write_manifest()
+            self._write_manifest(sync_to_server=True)
 
         # save used handler
         if ch._cached_handler is None:
@@ -234,8 +355,18 @@ class LabLog:
             self._current_log_size = 0
 
     def sync(self):
+        """User-triggered explicit sync."""
+        self._sync_internal()
+
+    def _sync_internal(self):
+        """Internal sync logic used by both user and background thread."""
         with self._lock:
-            self._rotate_log_file()
+            # Only rotate if there's actual data to rotate
+            if self._current_log_size > 0:
+                self._rotate_log_file()
+        
+        # sync_pending handles the actual upload and can be called outside the lock
+        # as ChunkSyncer has its own locking for network/state operations.
         self._syncer.sync_pending()
 
     def complete(self, status: str = "complete"):
@@ -254,7 +385,31 @@ class LabLog:
         final_chunk_idx = self._log_file_count - 1  # _log_file_count is next idx, so -1 is last
 
         if status == "complete":
-            self._syncer.complete(final_chunk_idx)
+            res = self._syncer.complete(final_chunk_idx)
+            if res:
+                # Success! Delete local cache
+                try:
+                    if self._lock_file_path.exists():
+                        self._lock_file_path.unlink()
+                    shutil.rmtree(self.run_path)
+                except Exception as e:
+                    warnings.warn(f"Failed to cleanup cache directory: {e}")
+            return res
+        else:
+            # For abort or incomplete, we don't necessarily delete the cache 
+            # unless we want to discard it.
+            if self._lock_file_path.exists():
+                self._lock_file_path.unlink()
+            return None
+
+    def abort(self, reason: str = "user_abort"):
+        """Abort the current run on the server."""
+        url = f"https://{self.server}/runs/{self.run_id}/abort"
+        try:
+            requests.post(url, json={"reason": reason}, timeout=2.0, verify=self.ssl_verify)
+        except Exception as e:
+            warnings.warn(f"Failed to send abort to server: {e}")
+        self.complete(status="aborted")
 
     def _generate_short_uuid(self) -> str:
         u = uuid.uuid4()
