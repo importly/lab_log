@@ -3,18 +3,19 @@ import time
 import threading
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 import requests
 
 
 class ChunkSyncer:
-    def __init__(self, run_path: Path, run_id: str, server: str, server_reachable: bool = True):
+    def __init__(self, run_path: Path, run_id: str, server: str, ssl_verify: bool | str = True):
         self.run_path = run_path
         self.run_id = run_id
         self.server = server
-        self._state_path = run_path / "sync_state.json"
+        self.ssl_verify = ssl_verify
+        self._state_path = run_path / "sync_state.json" # where chunks are confirmed to be
         self._lock = threading.Lock()
-        self._server_reachable = server_reachable
+        self._uploading_indices = set()
 
     def _load_state(self) -> dict:
         if not self._state_path.exists():
@@ -47,6 +48,18 @@ class ChunkSyncer:
                 pass
 
     def upload_chunk(self, chunk_idx: int) -> bool:
+        with self._lock:
+            if chunk_idx in self._uploading_indices:
+                return False
+            self._uploading_indices.add(chunk_idx)
+
+        try:
+            return self._do_upload_chunk(chunk_idx)
+        finally:
+            with self._lock:
+                self._uploading_indices.remove(chunk_idx)
+
+    def _do_upload_chunk(self, chunk_idx: int) -> bool:
         chunk_path = self.run_path / "chunks" / f"{chunk_idx:04d}.bin"
         if not chunk_path.exists():
             warnings.warn(f"Chunk file not found: {chunk_path}")
@@ -58,15 +71,7 @@ class ChunkSyncer:
             warnings.warn(f"Failed to read chunk {chunk_idx}: {e}")
             return False
 
-        if not self._server_reachable:
-            with self._lock:
-                state = self._load_state()
-                if chunk_idx not in state["pending_chunks"]:
-                    state["pending_chunks"].append(chunk_idx)
-                self._save_state(state)
-            return False
-
-        url = f"http://{self.server}/runs/{self.run_id}/chunks/{chunk_idx}"
+        url = f"https://{self.server}/runs/{self.run_id}/chunks/{chunk_idx}"
         try:
             resp = requests.post(
                 url,
@@ -76,10 +81,10 @@ class ChunkSyncer:
                     "X-Client-Upload-Ts-Ns": str(time.time_ns()),
                 },
                 timeout=(2.0, 30.0),  # 2s connect, 30s read
+                verify=self.ssl_verify,
             )
         except Exception as e:
             warnings.warn(f"Failed to upload chunk {chunk_idx}: {e}")
-            self._server_reachable = False
             with self._lock:
                 state = self._load_state()
                 if chunk_idx not in state["pending_chunks"]:
@@ -97,7 +102,7 @@ class ChunkSyncer:
                 self._save_state(state)
             return True
         else:
-            warnings.warn(f"Server returned {resp.status_code} for chunk {chunk_idx}")
+            warnings.warn(f"Server returned {resp.status_code} for chunk {chunk_idx}: {resp.text}")
             with self._lock:
                 state = self._load_state()
                 if chunk_idx not in state["pending_chunks"]:
@@ -114,7 +119,6 @@ class ChunkSyncer:
             state = self._load_state()
         
         confirmed = set(state["confirmed_chunks"])
-
 
         chunk_files = sorted(
             chunks_dir.glob("*.bin"),
@@ -137,15 +141,13 @@ class ChunkSyncer:
         return newly_confirmed
 
     def complete(self, final_chunk_idx: int) -> Optional[dict]:
-        if not self._server_reachable:
-            return None
-
-        url = f"http://{self.server}/runs/{self.run_id}/complete"
+        url = f"https://{self.server}/runs/{self.run_id}/complete"
         try:
             resp = requests.post(
                 url,
                 json={"final_chunk_idx": final_chunk_idx},
                 timeout=(2.0, 30.0),  # 2s connect, 30s read
+                verify=self.ssl_verify,
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -158,8 +160,8 @@ class ChunkSyncer:
 
 
 class BackgroundSyncThread:
-    def __init__(self, syncer: ChunkSyncer, interval_seconds: int = 30):
-        self._syncer = syncer
+    def __init__(self, sync_fn: Callable, interval_seconds: int = 30):
+        self._sync_fn = sync_fn
         self._interval = interval_seconds
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -172,7 +174,7 @@ class BackgroundSyncThread:
     def _run(self):
         while not self._stop_event.wait(timeout=self._interval):
             try:
-                self._syncer.sync_pending()
+                self._sync_fn()
             except Exception as e:
                 warnings.warn(f"Background sync error: {e}")
 

@@ -102,7 +102,7 @@ def get_or_make_handler(ch: Optional[ChannelDef], value: Any) -> Callable[[Any],
             _pickle_dumps = pickle.dumps
             def pickle_handler(val: Any):
                 v = user_ser(val)
-                return "json", {"json": _json_dumps(v, default=_json_default), "pickle": _pickle_dumps(v)}
+                return "json", {"json": _json_dumps(v, default=_json_default), "pickle": _pickle_dumps(val)}
             return pickle_handler
         
         # Non-pickle channel with serializer: we need to know what the serializer returns
@@ -131,9 +131,10 @@ def get_or_make_handler(ch: Optional[ChannelDef], value: Any) -> Callable[[Any],
 def resolve_value(channel_def: Optional[ChannelDef], value: Any) -> Tuple[str, Any]:
     # this remains for backward compatibility and auto detection
     if channel_def and channel_def.serializer is not None:
+        original_value = value
         value = channel_def.serializer(value)
         if channel_def.pickle:
-            return "json", {"json": _json_dumps(value, default=_json_default), "pickle": pickle.dumps(value)}
+            return "json", {"json": _json_dumps(value, default=_json_default), "pickle": pickle.dumps(original_value)}
 
     if torch is not None and isinstance(value, torch.Tensor):
         value = value.detach().cpu().numpy()
